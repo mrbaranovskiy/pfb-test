@@ -1,0 +1,38 @@
+# Build outputs
+bin/
+obj/
+
+# User-specific files
+*.user
+*.rsuser
+*.suo
+*.userosscache
+*.sln.docstates
+
+# IDE folders
+.vs/
+.vscode/
+.idea/
+
+# Test and coverage artifacts
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
+coverage/
+
+# BenchmarkDotNet artifacts
+BenchmarkDotNet.Artifacts/
+
+# NuGet
+packages/
+*.nupkg
+*.snupkg
+
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+
+# OS files
+.DS_Store
+Thumbs.db

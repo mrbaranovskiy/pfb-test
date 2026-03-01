@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <TargetFramework>net9.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="System.Numerics.Tensors" Version="7.0.0" />
+    <PackageReference Include="MathNet.Numerics" Version="5.0.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <!-- don't compile benchmark code in the main library project -->
+    <Compile Remove="Benchmarks\**\*.cs" />
+    <Compile Remove="WasmDotnet.Tests\**\*.cs" />
+  </ItemGroup>
+</Project>
