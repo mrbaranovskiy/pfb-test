@@ -62,3 +62,7 @@ On headless systems you may need additional Qt platform plugins (e.g. `qt5-defau
 
 The Python code also serves as a reference implementation of the analysis/synthesis
 filter design and the polyphase reconstructor used by the C# code.
+
+Using of the Demo. pcm16 wav files supported.  
+
+ .\Demo.exe input_iq.wav --lf 2450000 --uf 2550000 --output result_narrow.wav
