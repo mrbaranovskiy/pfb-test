@@ -1,76 +1,137 @@
 using System;
-using System.Linq;
-using Complex = System.Numerics.Complex;
-using MathNet.Numerics.IntegralTransforms;
+using System.Collections.Generic;
+using System.Globalization;
+using WasmDotnet;
 
-namespace WasmDotnet.Demo
+namespace WasmDotnet.Demo;
+
+internal static class Program
 {
-    class Program
+    private static int Main(string[] args)
     {
-        static void Main(string[] args)
+        try
         {
-            // Parameters: match Python demo
-            int K = 64;       // Number of frequency bins (channels)
-            int P = 4;        // Decimation / folding factor
-            int L = 16;       // Subband width to reconstruct
-            int R = 8;        // Synthesis interpolation
-            int startBin = 10; // Which bin to start extracting from
+            CommandLineOptions options = CommandLineOptions.Parse(args);
 
-            // 1. Design analysis and synthesis filters
-            Console.WriteLine("Designing filters...");
-            float[] h = FilterDesign.GenAnalysisFilter(K, P);
-            float[] x = BlsSolver.Solve(h, K, P);
-            Console.WriteLine($"  Analysis filter: {h.Length} taps");
-            Console.WriteLine($"  Synthesis filter: {x.Length} taps");
+            Console.WriteLine($"Reading IQ WAV: {options.InputPath}");
+            IqWaveFile input = IqWaveFile.Read(options.InputPath);
+            Console.WriteLine($"  Sample rate: {input.SampleRate} Hz");
+            Console.WriteLine($"  IQ samples:  {input.Samples.Length}");
+            Console.WriteLine($"  Duration:    {input.Samples.Length / (double)input.SampleRate:F3} s");
 
-            var recon = new PartialBandReconstructor(x, L, R);
+            ChannelizationResult result = IqChannelizer.Channelize(
+                input.Samples,
+                input.SampleRate,
+                options.LowerFrequencyHz,
+                options.UpperFrequencyHz);
 
-            // 2. Generate a time-domain wideband signal with harmonics
-            Console.WriteLine($"\nGenerating wideband signal ({K} samples)...");
-            var timeDomain = new Complex[K];
-            int[] harmonics = { 3, 7, 13, 29 };
-            for (int hidx = 0; hidx < harmonics.Length; hidx++)
+            ChannelizationParameters parameters = result.Parameters;
+            Console.WriteLine();
+            Console.WriteLine("Estimated channelization parameters:");
+            Console.WriteLine($"  Lower cut:       {parameters.LowerFrequencyHz:F3} Hz");
+            Console.WriteLine($"  Upper cut:       {parameters.UpperFrequencyHz:F3} Hz");
+            Console.WriteLine($"  Center shift:    {parameters.CenterFrequencyHz:F3} Hz");
+            Console.WriteLine($"  Bandwidth:       {parameters.BandwidthHz:F3} Hz");
+            Console.WriteLine($"  Decimation:      {parameters.DecimationFactor}");
+            Console.WriteLine($"  Output rate:     {parameters.OutputSampleRate} Hz");
+            Console.WriteLine($"  Filter taps:     {parameters.FilterTapCount}");
+            Console.WriteLine($"  Output IQ count: {result.Samples.Length}");
+
+            Console.WriteLine();
+            Console.WriteLine($"Writing channelized IQ WAV: {options.OutputPath}");
+            new IqWaveFile(parameters.OutputSampleRate, result.Samples).Write(options.OutputPath);
+
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            Console.Error.WriteLine();
+            Console.Error.WriteLine(CommandLineOptions.Usage);
+            return 1;
+        }
+    }
+
+    private sealed record CommandLineOptions(
+        string InputPath,
+        double LowerFrequencyHz,
+        double UpperFrequencyHz,
+        string OutputPath)
+    {
+        public const string Usage =
+            """
+            Usage:
+              dotnet run --project Demo -- <input.wav> --lf <hz> --uf <hz> --output <output.wav>
+
+            Options:
+              --wavefile <path>  Input 16-bit stereo IQ WAV file. Optional if passed positionally.
+              --lf <hz>          Lower cut frequency in Hz.
+              --uf <hz>          Upper cut frequency in Hz.
+              --output <path>    Output path for the channelized 16-bit stereo IQ WAV file.
+            """;
+
+        public static CommandLineOptions Parse(string[] args)
+        {
+            if (args.Length == 0 || Array.Exists(args, static arg => arg is "--help" or "-h"))
+                throw new ArgumentException("Missing required arguments.");
+
+            string? inputPath = null;
+            string? outputPath = null;
+            double? lowerFrequency = null;
+            double? upperFrequency = null;
+
+            for (int i = 0; i < args.Length; i++)
             {
-                int hfreq = harmonics[hidx];
-                for (int k = 0; k < K; k++)
+                string arg = args[i];
+                switch (arg)
                 {
-                    timeDomain[k] += Complex.Exp(new Complex(0, 2 * Math.PI * hfreq * k / K));
+                    case "--wavefile":
+                        inputPath = ReadRequiredValue(args, ref i, "--wavefile");
+                        break;
+                    case "--lf":
+                        lowerFrequency = ParseDouble(ReadRequiredValue(args, ref i, "--lf"), "--lf");
+                        break;
+                    case "--uf":
+                        upperFrequency = ParseDouble(ReadRequiredValue(args, ref i, "--uf"), "--uf");
+                        break;
+                    case "--output":
+                        outputPath = ReadRequiredValue(args, ref i, "--output");
+                        break;
+                    default:
+                        if (arg.StartsWith("--", StringComparison.Ordinal))
+                            throw new ArgumentException($"Unknown option '{arg}'.");
+                        inputPath ??= arg;
+                        break;
                 }
             }
-            Console.WriteLine($"  Added {harmonics.Length} harmonic components");
 
-            // 3. Perform FFT to get frequency-domain channels
-            Console.WriteLine("\nPerforming FFT (analysis)...");
-            var fullBand = new Complex[K];
-            Array.Copy(timeDomain, fullBand, K);
-            Fourier.Forward(fullBand, FourierOptions.Matlab);
+            if (string.IsNullOrWhiteSpace(inputPath))
+                throw new ArgumentException("Input WAV file is required.");
+            if (lowerFrequency is null)
+                throw new ArgumentException("--lf is required.");
+            if (upperFrequency is null)
+                throw new ArgumentException("--uf is required.");
+            if (string.IsNullOrWhiteSpace(outputPath))
+                throw new ArgumentException("--output is required.");
 
-            // 4. Extract a subband (L consecutive bins starting at startBin)
-            Console.WriteLine($"Extracting subband: bins [{startBin}, {startBin + L})...");
-            var selected = new Complex[L];
-            Array.Copy(fullBand, startBin, selected, 0, L);
+            return new CommandLineOptions(inputPath, lowerFrequency.Value, upperFrequency.Value, outputPath);
+        }
 
-            // Show magnitudes of selected bins
-            double avgMag = selected.Average(c => c.Magnitude);
-            Console.WriteLine($"  Selected bins avg magnitude: {avgMag:F4}");
+        private static string ReadRequiredValue(IReadOnlyList<string> args, ref int index, string option)
+        {
+            if (index + 1 >= args.Count)
+                throw new ArgumentException($"Missing value for {option}.");
 
-            // 5. Synthesize back to time domain
-            Console.WriteLine("\nPerforming synthesis (IFFT + polyphase filtering)...");
-            var narrow = new Complex[R];
-            recon.ProcessSynthesisBlock(selected, narrow);
+            index++;
+            return args[index];
+        }
 
-            Console.WriteLine($"\n=== Results ===");
-            Console.WriteLine($"Input: {K} frequency bins");
-            Console.WriteLine($"Extracted: {L} bins from [{startBin}, {startBin + L})");
-            Console.WriteLine($"Reconstructed: {narrow.Length} time-domain samples");
-            Console.WriteLine($"Reconstruction signal magnitude (avg): {narrow.Average(c => c.Magnitude):F4}");
+        private static double ParseDouble(string value, string option)
+        {
+            if (!double.TryParse(value, NumberStyles.Float | NumberStyles.AllowThousands, CultureInfo.InvariantCulture, out double parsed))
+                throw new ArgumentException($"Invalid numeric value '{value}' for {option}.");
 
-            // 6. Optional: Show first few samples
-            Console.WriteLine($"\nFirst 5 reconstructed samples (Real, Imag):");
-            for (int i = 0; i < Math.Min(5, narrow.Length); i++)
-            {
-                Console.WriteLine($"  [{i}] = ({narrow[i].Real:F4}, {narrow[i].Imaginary:F4})");
-            }
+            return parsed;
         }
     }
 }

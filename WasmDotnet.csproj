@@ -5,14 +5,18 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="System.Numerics.Tensors" Version="7.0.0" />
+    <PackageReference Include="System.Numerics.Tensors" Version="8.0.0" />
     <PackageReference Include="MathNet.Numerics" Version="5.0.0" />
   </ItemGroup>
   <ItemGroup>
-    <!-- don't compile benchmark code in the main library project -->
+    <!-- don't compile child project or generated code in the main library project -->
+    <Compile Remove="Demo\**\*.cs" />
     <Compile Remove="Benchmarks\**\*.cs" />
     <Compile Remove="WasmDotnet.Tests\**\*.cs" />
+    <Compile Remove="**\obj\**\*.cs" />
+    <Compile Remove="**\bin\**\*.cs" />
   </ItemGroup>
 </Project>
