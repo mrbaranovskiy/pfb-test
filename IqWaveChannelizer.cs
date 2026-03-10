@@ -1,9 +1,11 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Numerics;
 using System.Text;
 using System.Threading.Tasks;
+using MathNet.Numerics.IntegralTransforms;
 
 namespace WasmDotnet;
 
@@ -181,13 +183,22 @@ public sealed record ChannelizationParameters(
     int InputSampleRate,
     int OutputSampleRate,
     int DecimationFactor,
-    int FilterTapCount);
+    int FilterTapCount,
+    int FftSize,
+    int FoldFactor,
+    int SelectedBinCount,
+    int ReconstructionRate,
+    int StartBin);
 
 public sealed record ChannelizationResult(Complex[] Samples, ChannelizationParameters Parameters);
 
 public static class IqChannelizer
 {
     private const double OversamplingFactor = 1.25;
+    private const int DefaultFoldFactor = 4;
+    private const int TargetSelectedBins = 16;
+    private static readonly int[] SupportedFftSizes = [64, 128, 256];
+    private static readonly ConcurrentDictionary<(int FftSize, int FoldFactor), float[]> SynthesisFilterCache = new();
 
     public static ChannelizationResult Channelize(
         IReadOnlyList<Complex> input,
@@ -206,158 +217,140 @@ public static class IqChannelizer
         if (lowerFrequencyHz < -nyquist || upperFrequencyHz > nyquist)
             throw new ArgumentOutOfRangeException(nameof(lowerFrequencyHz), $"Requested band must stay within [{-nyquist}, {nyquist}] Hz.");
 
+        ChannelizationParameters parameters = EstimateParameters(input.Count, inputSampleRate, lowerFrequencyHz, upperFrequencyHz);
+        float[] synthFilter = GetSynthesisFilter(parameters.FftSize, parameters.FoldFactor);
+        var reconstructor = new PartialBandReconstructor(synthFilter, parameters.SelectedBinCount, parameters.ReconstructionRate);
+        Complex[] output = ChannelizeWithReconstructor(input, parameters, reconstructor);
+
+        return new ChannelizationResult(output, parameters);
+    }
+
+    private static ChannelizationParameters EstimateParameters(
+        int inputLength,
+        int inputSampleRate,
+        double lowerFrequencyHz,
+        double upperFrequencyHz)
+    {
         double bandwidth = upperFrequencyHz - lowerFrequencyHz;
         double centerFrequency = (lowerFrequencyHz + upperFrequencyHz) / 2.0;
-        double minimumOutputRate = bandwidth * OversamplingFactor;
-        int decimation = EstimateDecimation(inputSampleRate, minimumOutputRate);
-        int outputSampleRate = inputSampleRate / decimation;
+        int fftSize = ChooseFftSize(inputLength, inputSampleRate, bandwidth);
+        double binWidth = inputSampleRate / (double)fftSize;
+        int selectedBinCount = NextPowerOfTwo((int)Math.Ceiling((bandwidth * fftSize / inputSampleRate) * OversamplingFactor));
+        selectedBinCount = Math.Clamp(selectedBinCount, 4, fftSize);
 
-        double passbandEdge = bandwidth / 2.0;
-        double outputNyquist = outputSampleRate / 2.0;
-        if (passbandEdge >= outputNyquist)
-            throw new InvalidOperationException("Requested band is too wide for the estimated decimation.");
+        int reconstructionRate = selectedBinCount;
+        int decimationFactor = fftSize / reconstructionRate;
+        int outputSampleRate = inputSampleRate / decimationFactor;
+        int startBin = EstimateStartBin(fftSize, inputSampleRate, centerFrequency, selectedBinCount);
+        int filterTapCount = fftSize * DefaultFoldFactor;
 
-        double transitionBudget = outputNyquist - passbandEdge;
-        double cutoff = passbandEdge + transitionBudget * 0.35;
-        int tapCount = EstimateTapCount(inputSampleRate, transitionBudget);
-        double[] taps = DesignLowPass(cutoff, inputSampleRate, tapCount);
-
-        Complex[] mixed = FrequencyShift(input, centerFrequency, inputSampleRate);
-        Complex[] output = FilterAndDecimate(mixed, taps, decimation);
-
-        var parameters = new ChannelizationParameters(
+        return new ChannelizationParameters(
             lowerFrequencyHz,
             upperFrequencyHz,
             centerFrequency,
             bandwidth,
             inputSampleRate,
             outputSampleRate,
-            decimation,
-            tapCount);
-
-        return new ChannelizationResult(output, parameters);
+            decimationFactor,
+            filterTapCount,
+            fftSize,
+            DefaultFoldFactor,
+            selectedBinCount,
+            reconstructionRate,
+            startBin);
     }
 
-    private static int EstimateDecimation(int inputSampleRate, double minimumOutputRate)
+    private static Complex[] ChannelizeWithReconstructor(
+        IReadOnlyList<Complex> input,
+        ChannelizationParameters parameters,
+        PartialBandReconstructor reconstructor)
     {
-        if (minimumOutputRate > inputSampleRate)
-            throw new InvalidOperationException("Requested band exceeds the input sample rate.");
+        int blockCount = input.Count / parameters.FftSize;
+        if (blockCount == 0)
+            throw new InvalidOperationException($"Input is too short for FFT size {parameters.FftSize}. Need at least one full block.");
 
-        int maxDecimation = Math.Max(1, (int)Math.Floor(inputSampleRate / minimumOutputRate));
-        for (int decimation = maxDecimation; decimation >= 1; decimation--)
+        var output = new Complex[blockCount * parameters.ReconstructionRate];
+        var fftBuffer = new Complex[parameters.FftSize];
+        var selectedBins = new Complex[parameters.SelectedBinCount];
+        var narrowband = new Complex[parameters.ReconstructionRate];
+
+        for (int blockIndex = 0; blockIndex < blockCount; blockIndex++)
         {
-            if (inputSampleRate % decimation == 0)
-                return decimation;
+            int inputOffset = blockIndex * parameters.FftSize;
+            for (int i = 0; i < parameters.FftSize; i++)
+                fftBuffer[i] = input[inputOffset + i];
+
+            Fourier.Forward(fftBuffer, FourierOptions.Matlab);
+            SelectShiftedBins(fftBuffer, parameters.StartBin, selectedBins);
+            reconstructor.ProcessSynthesisBlock(selectedBins, narrowband);
+            Array.Copy(narrowband, 0, output, blockIndex * parameters.ReconstructionRate, parameters.ReconstructionRate);
         }
-
-        return 1;
-    }
-
-    private static int EstimateTapCount(int inputSampleRate, double transitionWidthHz)
-    {
-        double safeTransition = Math.Max(transitionWidthHz, inputSampleRate * 0.0025);
-        int tapCount = (int)Math.Ceiling(5.5 * inputSampleRate / safeTransition);
-        tapCount = Math.Clamp(tapCount, 63, 2047);
-        if (tapCount % 2 == 0)
-            tapCount++;
-
-        return tapCount;
-    }
-
-    private static double[] DesignLowPass(double cutoffHz, int sampleRate, int tapCount)
-    {
-        var taps = new double[tapCount];
-        double normalizedCutoff = cutoffHz / sampleRate;
-        double midpoint = (tapCount - 1) / 2.0;
-        double sum = 0.0;
-
-        for (int i = 0; i < tapCount; i++)
-        {
-            double n = i - midpoint;
-            double sinc = Math.Abs(n) < double.Epsilon
-                ? 2.0 * normalizedCutoff
-                : Math.Sin(2.0 * Math.PI * normalizedCutoff * n) / (Math.PI * n);
-            double window = BlackmanHarris(i, tapCount);
-            taps[i] = sinc * window;
-            sum += taps[i];
-        }
-
-        for (int i = 0; i < taps.Length; i++)
-            taps[i] /= sum;
-
-        return taps;
-    }
-
-    private static Complex[] FrequencyShift(IReadOnlyList<Complex> input, double centerFrequencyHz, int sampleRate)
-    {
-        var shifted = new Complex[input.Count];
-        double phaseStep = -2.0 * Math.PI * centerFrequencyHz / sampleRate;
-        Complex rotation = Complex.FromPolarCoordinates(1.0, phaseStep);
-        Complex oscillator = Complex.One;
-
-        for (int i = 0; i < input.Count; i++)
-        {
-            shifted[i] = input[i] * oscillator;
-            oscillator *= rotation;
-
-            if ((i & 1023) == 1023)
-            {
-                double phase = phaseStep * (i + 1L);
-                oscillator = Complex.FromPolarCoordinates(1.0, phase);
-            }
-        }
-
-        return shifted;
-    }
-
-    private static Complex[] FilterAndDecimate(Complex[] input, double[] taps, int decimation)
-    {
-        int halfLength = taps.Length / 2;
-        int usableSamples = input.Length - (2 * halfLength);
-        if (usableSamples <= 0)
-            throw new InvalidOperationException("Input is too short for the designed filter. Use a longer file or a wider channel.");
-
-        int outputLength = 1 + ((usableSamples - 1) / decimation);
-        var output = new Complex[outputLength];
-        long workEstimate = (long)outputLength * taps.Length;
-
-        if (workEstimate < 131_072 || Environment.ProcessorCount == 1)
-        {
-            for (int outputIndex = 0; outputIndex < outputLength; outputIndex++)
-                output[outputIndex] = FilterOutput(input, taps, decimation, halfLength, outputIndex);
-
-            return output;
-        }
-
-        Parallel.For(0, outputLength, outputIndex =>
-        {
-            output[outputIndex] = FilterOutput(input, taps, decimation, halfLength, outputIndex);
-        });
 
         return output;
     }
 
-    private static Complex FilterOutput(Complex[] input, double[] taps, int decimation, int halfLength, int outputIndex)
+    private static float[] GetSynthesisFilter(int fftSize, int foldFactor)
     {
-        int center = halfLength + (outputIndex * decimation);
-        int start = center - halfLength;
-        Complex sum = Complex.Zero;
-
-        for (int tap = 0; tap < taps.Length; tap++)
-            sum += input[start + tap] * taps[tap];
-
-        return sum;
+        return SynthesisFilterCache.GetOrAdd((fftSize, foldFactor), key =>
+        {
+            float[] analysis = FilterDesign.GenAnalysisFilter(key.FftSize, key.FoldFactor);
+            return BlsSolver.Solve(analysis, key.FftSize, key.FoldFactor);
+        });
     }
 
-    private static double BlackmanHarris(int index, int length)
+    private static int ChooseFftSize(int inputLength, int inputSampleRate, double bandwidthHz)
     {
-        if (length == 1)
-            return 1.0;
+        int bestFftSize = 0;
+        double bestScore = double.MaxValue;
 
-        double x = 2.0 * Math.PI * index / (length - 1);
-        return 0.35875
-               - 0.48829 * Math.Cos(x)
-               + 0.14128 * Math.Cos(2.0 * x)
-               - 0.01168 * Math.Cos(3.0 * x);
+        for (int i = 0; i < SupportedFftSizes.Length; i++)
+        {
+            int candidate = SupportedFftSizes[i];
+            if (candidate > inputLength)
+                continue;
+
+            double binsAcrossBand = bandwidthHz * candidate / inputSampleRate;
+            double score = Math.Abs(binsAcrossBand - TargetSelectedBins);
+            if (score < bestScore)
+            {
+                bestScore = score;
+                bestFftSize = candidate;
+            }
+        }
+
+        if (bestFftSize == 0)
+            throw new InvalidOperationException("Input is too short for the supported reconstructor FFT sizes.");
+
+        return bestFftSize;
+    }
+
+    private static int EstimateStartBin(int fftSize, int inputSampleRate, double centerFrequencyHz, int selectedBinCount)
+    {
+        double shiftedCenter = (centerFrequencyHz + (inputSampleRate / 2.0)) * fftSize / inputSampleRate;
+        int centerBin = (int)Math.Round(shiftedCenter);
+        int startBin = centerBin - (selectedBinCount / 2);
+        return Math.Clamp(startBin, 0, fftSize - selectedBinCount);
+    }
+
+    private static void SelectShiftedBins(Complex[] fftBins, int startBin, Span<Complex> selectedBins)
+    {
+        int fftSize = fftBins.Length;
+        int halfFft = fftSize / 2;
+
+        for (int i = 0; i < selectedBins.Length; i++)
+        {
+            int shiftedIndex = startBin + i;
+            int sourceIndex = (shiftedIndex + halfFft) % fftSize;
+            selectedBins[i] = fftBins[sourceIndex];
+        }
+    }
+
+    private static int NextPowerOfTwo(int value)
+    {
+        int result = 1;
+        while (result < value)
+            result <<= 1;
+
+        return result;
     }
 }

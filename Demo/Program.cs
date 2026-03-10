@@ -35,6 +35,11 @@ internal static class Program
             Console.WriteLine($"  Decimation:      {parameters.DecimationFactor}");
             Console.WriteLine($"  Output rate:     {parameters.OutputSampleRate} Hz");
             Console.WriteLine($"  Filter taps:     {parameters.FilterTapCount}");
+            Console.WriteLine($"  FFT size K:      {parameters.FftSize}");
+            Console.WriteLine($"  Fold factor P:   {parameters.FoldFactor}");
+            Console.WriteLine($"  Selected bins L: {parameters.SelectedBinCount}");
+            Console.WriteLine($"  Output bins R:   {parameters.ReconstructionRate}");
+            Console.WriteLine($"  Start bin:       {parameters.StartBin}");
             Console.WriteLine($"  Output IQ count: {result.Samples.Length}");
 
             Console.WriteLine();
